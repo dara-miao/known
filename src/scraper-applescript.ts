@@ -5,7 +5,10 @@
  */
 
 import { execSync } from "child_process";
-import { platform } from "os";
+import { writeFileSync, unlinkSync } from "fs";
+import { createServer } from "http";
+import { join } from "path";
+import { tmpdir, platform } from "os";
 
 export interface ScrapedConnection {
   submissionId: string;
@@ -35,9 +38,6 @@ function runAppleScript(script: string): string {
 }
 
 function runAppleScriptFile(script: string): string {
-  const { writeFileSync, unlinkSync } = require("fs");
-  const { join } = require("path");
-  const { tmpdir } = require("os");
   const tmp = join(tmpdir(), `linkedin-clay-${Date.now()}.scpt`);
   writeFileSync(tmp, script);
   try {
@@ -52,32 +52,53 @@ function runAppleScriptFile(script: string): string {
 
 /** Find the Chrome tab that has LinkedIn connections open */
 function findLinkedInTab(): { windowIndex: number; tabIndex: number } | null {
-  const script = `
-tell application "Google Chrome"
-  set result to ""
-  set winIdx to 1
-  repeat with w in windows
-    set tabIdx to 1
-    repeat with t in tabs of w
-      if URL of t contains "linkedin.com/mynetwork/invite-connect/connections" then
-        set result to winIdx & "," & tabIdx
-        return result
-      end if
-      set tabIdx to tabIdx + 1
-    end repeat
-    set winIdx to winIdx + 1
-  end repeat
-  return ""
-end tell
-  `;
+  // First try: check if the active tab of the front window is the connections page
   try {
-    const out = runAppleScriptFile(script).trim();
-    if (!out) return null;
-    const [w, t] = out.split(",").map(Number);
-    return { windowIndex: w, tabIndex: t };
-  } catch {
-    return null;
-  }
+    const activeUrl = execSync(
+      `osascript -e 'tell application "Google Chrome" to get URL of active tab of front window'`,
+      { encoding: "utf-8", stdio: ["pipe", "pipe", "ignore"] }
+    ).trim();
+
+    if (activeUrl.includes("linkedin.com/mynetwork/invite-connect/connections")) {
+      // Get the active tab index
+      const tabIdx = parseInt(
+        execSync(
+          `osascript -e 'tell application "Google Chrome" to get active tab index of front window'`,
+          { encoding: "utf-8", stdio: ["pipe", "pipe", "ignore"] }
+        ).trim()
+      );
+      return { windowIndex: 1, tabIndex: isNaN(tabIdx) ? 1 : tabIdx };
+    }
+  } catch {}
+
+  // Second try: scan all windows/tabs
+  try {
+    const winCount = parseInt(
+      execSync(`osascript -e 'tell application "Google Chrome" to count windows'`, {
+        encoding: "utf-8", stdio: ["pipe", "pipe", "ignore"],
+      }).trim()
+    );
+
+    for (let w = 1; w <= winCount; w++) {
+      const tabCount = parseInt(
+        execSync(
+          `osascript -e 'tell application "Google Chrome" to count tabs of window ${w}'`,
+          { encoding: "utf-8", stdio: ["pipe", "pipe", "ignore"] }
+        ).trim()
+      );
+      for (let t = 1; t <= tabCount; t++) {
+        const url = execSync(
+          `osascript -e 'tell application "Google Chrome" to get URL of tab ${t} of window ${w}'`,
+          { encoding: "utf-8", stdio: ["pipe", "pipe", "ignore"] }
+        ).trim();
+        if (url.includes("linkedin.com/mynetwork/invite-connect/connections")) {
+          return { windowIndex: w, tabIndex: t };
+        }
+      }
+    }
+  } catch {}
+
+  return null;
 }
 
 /** Execute JS in a specific Chrome tab via AppleScript */
@@ -102,11 +123,11 @@ async function scrollToLoadAll(
   let noNewRounds = 0;
 
   while (noNewRounds < 4) {
-    // Count visible connection cards
+    // Count unique /in/ profile links as a proxy for loaded connections
     const countStr = executeJS(
       windowIndex,
       tabIndex,
-      `document.querySelectorAll("li.mn-connection-card, li[class*='connection-card']").length`
+      `(function(){ var s={}; document.querySelectorAll("a[href*='/in/']").forEach(function(a){if(a.href)s[a.href.split('?')[0]]=1;}); return Object.keys(s).length; })()`
     );
     const count = parseInt(countStr) || 0;
     onProgress(count);
@@ -135,35 +156,64 @@ async function scrollToLoadAll(
   }
 }
 
-/** Extract all connection data from the page via AppleScript JS execution */
-function extractConnections(windowIndex: number, tabIndex: number): ScrapedConnection[] {
-  const js = `
+/** Extract all connection data via localStorage (bypasses CSP) */
+async function extractConnections(windowIndex: number, tabIndex: number): Promise<ScrapedConnection[]> {
+  // Step 1: run extraction JS in Chrome, store result in localStorage
+  const extractJs = `
 (function() {
-  var cards = document.querySelectorAll("li.mn-connection-card, li[class*='connection-card']");
+  var seen = {};
   var results = [];
-  cards.forEach(function(node) {
-    var anchor = node.querySelector("a[href*='/in/']");
-    var nameEl = node.querySelector(".mn-connection-card__name, [class*='connection-card__name']");
-    var occEl = node.querySelector(".mn-connection-card__occupation, [class*='connection-card__occupation']");
-    var timeEl = node.querySelector("time, .mn-connection-card__connected-date");
-    var url = anchor ? anchor.href.split("?")[0] : "";
-    var name = nameEl ? nameEl.textContent.trim() : "";
-    var occ = occEl ? occEl.textContent.trim() : "";
+  document.querySelectorAll("a[href*='/in/']").forEach(function(a) {
+    var url = a.href ? a.href.split("?")[0] : "";
+    if (!url || seen[url]) return;
+    var label = (a.getAttribute("aria-label") || "").trim();
+    var text = (a.innerText || "").trim();
+    var raw = label || text;
+    if (!raw || raw.length < 2) return;
+    var parts = raw.split(/\\n\\n+/);
+    var name = parts[0].trim();
+    var occ = (parts[1] || "").trim();
+    if (!name || name.length < 2) return;
     var position = occ, company = "";
     var atIdx = occ.lastIndexOf(" at ");
     if (atIdx !== -1) { position = occ.slice(0, atIdx).trim(); company = occ.slice(atIdx + 4).trim(); }
-    if (name && url) results.push({ url: url, name: name, position: position, company: company, connectedOn: timeEl ? (timeEl.getAttribute("datetime") || "") : "" });
+    var parent = a.parentElement;
+    var timeEl = null;
+    for (var i = 0; i < 6 && parent; i++) { timeEl = parent.querySelector("time"); if (timeEl) break; parent = parent.parentElement; }
+    seen[url] = true;
+    results.push({ url: url, name: name, position: position, company: company, connectedOn: timeEl ? (timeEl.getAttribute("datetime") || "") : "" });
   });
-  return JSON.stringify(results);
-})()
-  `;
+  localStorage.setItem("__lcs_connections__", JSON.stringify(results));
+  return results.length;
+})()`;
 
-  const raw = executeJS(windowIndex, tabIndex, js);
-  // AppleScript wraps string results in quotes sometimes
-  const cleaned = raw.replace(/^"|"$/g, "").replace(/\\"/g, '"');
+  const countStr = executeJS(windowIndex, tabIndex, extractJs);
+  console.log(`  Stored ${countStr} connections in localStorage...`);
 
-  const items: Array<{ url: string; name: string; position: string; company: string; connectedOn: string }> =
-    JSON.parse(cleaned);
+  // Step 2: read it back in chunks (localStorage values can be large but AppleScript has limits)
+  // Split by reading total length first, then chunking
+  const totalStr = executeJS(
+    windowIndex, tabIndex,
+    `localStorage.getItem("__lcs_connections__") ? localStorage.getItem("__lcs_connections__").length : 0`
+  );
+  const total = parseInt(totalStr) || 0;
+
+  const CHUNK = 200_000; // 200KB per read
+  let json = "";
+  for (let offset = 0; offset < total; offset += CHUNK) {
+    const chunk = executeJS(
+      windowIndex, tabIndex,
+      `localStorage.getItem("__lcs_connections__").slice(${offset}, ${offset + CHUNK})`
+    );
+    json += chunk;
+  }
+
+  // Clean up
+  executeJS(windowIndex, tabIndex, `localStorage.removeItem("__lcs_connections__")`);
+
+  const items = JSON.parse(json) as Array<{
+    url: string; name: string; position: string; company: string; connectedOn: string;
+  }>;
 
   return items.map((item) => {
     const [firstName = "", ...rest] = item.name.split(" ");
@@ -213,7 +263,7 @@ export async function scrapeViaAppleScript(opts: {
   process.stdout.write("\n");
   console.log(`\nExtracting ${visible} connections...`);
 
-  const connections = extractConnections(tab.windowIndex, tab.tabIndex);
+  const connections = await extractConnections(tab.windowIndex, tab.tabIndex);
   console.log(`✓ Extracted ${connections.length} connections\n`);
 
   return connections;
