@@ -1,106 +1,94 @@
 # linkedin-clay-sync
 
-Sync your LinkedIn connections into [Clay](https://clay.com) (or any webhook endpoint) — **no LinkedIn API required**.
+Sync your LinkedIn connections into [Clay](https://clay.com) automatically — no LinkedIn API, no manual exports, no new browser windows.
 
-LinkedIn doesn't have a public connections API. This tool works around that using your LinkedIn data export, pushing each connection to Clay where it gets auto-enriched with emails, company data, and AI-generated outreach.
-
----
-
-## What it does
-
-- Parses your LinkedIn `Connections.csv` export
-- Pushes each connection to a Clay webhook (or any HTTP endpoint)
-- Tracks which connections have already been synced — only sends new ones on subsequent runs
-- Optional: installs a daily macOS LaunchAgent so new connections sync automatically every morning
+**macOS**: reads directly from your already-open Chrome tab. One command, done.
+**Other platforms**: opens a browser, you log in once, session is saved forever.
 
 ---
 
-## Setup
+## Quickstart (macOS)
 
-### 1. Export your LinkedIn connections
+**1.** Open your LinkedIn connections page in Chrome:
 
-1. Go to [linkedin.com](https://linkedin.com) → Settings & Privacy
-2. Data Privacy → Get a copy of your data
-3. Select **Connections** only → Request archive
-4. LinkedIn emails you a download link (usually within minutes)
-5. Unzip → find `Connections.csv`
+```
+https://www.linkedin.com/mynetwork/invite-connect/connections/
+```
 
-### 2. Get your Clay webhook URL
+**2.** Enable JavaScript from Apple Events in Chrome:
 
-In your Clay table:
-1. Click **Sources** → **+ Add Source** → **Webhook**
-2. Copy the webhook URL
+> Chrome menu bar → View → Developer → Allow JavaScript from Apple Events
 
-### 3. Install and run
+**3.** Clone and run:
 
 ```bash
 git clone https://github.com/calebnewtonusc/linkedin-clay-sync
 cd linkedin-clay-sync
 npm install
-
-# Sync your connections
-CLAY_WEBHOOK_URL=https://api.clay.com/v3/sources/webhook/YOUR_TOKEN \
-  npm run sync ~/Downloads/Connections.csv
+cp .env.example .env
+# Add your Clay webhook URL to .env
+npm run scrape
 ```
 
-Or create a `.env` file:
+That's it. All your connections are in Clay.
+
+---
+
+## Setup
+
+### Get your Clay webhook URL
+
+1. Go to your Clay table
+2. Click **Sources** → **+ Add Source** → **Webhook**
+3. Copy the URL
+
+### Configure
 
 ```bash
 cp .env.example .env
-# Fill in CLAY_WEBHOOK_URL
 ```
 
-Then just:
+Edit `.env`:
 
-```bash
-npm run sync
-# Auto-detects Connections.csv from ~/Downloads
+```env
+CLAY_WEBHOOK_URL=https://api.clay.com/v3/sources/webhook/your-token-here
 ```
 
 ---
 
 ## Commands
 
-### `sync [csv]`
+### `npm run scrape` (recommended)
 
-Push LinkedIn connections to Clay. Only sends connections not previously synced.
+Scrapes LinkedIn directly from your open Chrome tab (macOS) or via Playwright browser (other platforms). Only sends connections not previously synced — safe to re-run anytime.
 
 ```bash
-npm run sync                          # auto-detects CSV from ~/Downloads
-npm run sync ~/path/to/Connections.csv
-npm run sync -- --all                 # re-sync everything
-npm run sync -- --dry-run             # count without sending
-npm run sync -- --webhook <url>       # override webhook URL
+npm run scrape
+npm run scrape -- --dry-run       # count without sending
+npm run scrape -- --playwright    # force Playwright browser on macOS
 ```
 
-### `install-cron`
+### `npm run sync` (CSV fallback)
 
-Install a macOS LaunchAgent that runs sync every morning at 8am.
+If you have a LinkedIn data export CSV:
 
 ```bash
-npm run install-cron -- --webhook https://api.clay.com/v3/sources/webhook/YOUR_TOKEN
-# Then activate it:
+npm run sync ~/Downloads/Connections.csv
+npm run sync -- --all             # re-sync everything
+```
+
+### `npm run install-cron`
+
+Install a macOS LaunchAgent that scrapes and syncs every morning at 8am automatically — new connections appear in Clay overnight.
+
+```bash
+npm run install-cron
 launchctl load ~/Library/LaunchAgents/com.calebnewton.linkedin-clay-sync.plist
 ```
 
-After this, just re-download your LinkedIn export occasionally and the next morning run will pick up new connections automatically.
-
 ---
 
-## Clay enrichment setup
-
-Once connections are in Clay, add these columns to enrich each person:
-
-| Column | Type | Config |
-|---|---|---|
-| Email | Find email | Map on `linkedin_url` via Apollo or Hunter |
-| Company info | Clearbit | Map on `company` |
-| Current role | LinkedIn Profile | Map on `linkedin_url` |
-| Outreach draft | AI | Prompt: "Write a personalized connection message for {name} at {company}" |
-
----
-
-## Data fields sent to Clay
+## What gets sent to Clay
 
 ```json
 {
@@ -109,25 +97,42 @@ Once connections are in Clay, add these columns to enrich each person:
   "first_name": "Caleb",
   "last_name": "Newton",
   "linkedin_url": "https://www.linkedin.com/in/calebnewton-/",
-  "email": "",
-  "company": "Blue Modern Advisory",
   "position": "Founder",
-  "connected_on": "21 Mar 2026",
-  "source": "linkedin_export",
-  "synced_at": "2026-03-21T00:00:00.000Z"
+  "company": "Blue Modern Advisory",
+  "connected_on": "2026-03-21",
+  "source": "linkedin_applescript",
+  "synced_at": "2026-03-21T08:00:00.000Z"
 }
 ```
 
-`submission_id` is used as Clay's deduplication key — safe to re-run without creating duplicates.
+`submission_id` is the deduplication key — re-running never creates duplicates.
 
 ---
 
-## Why this exists
+## Clay enrichment setup
 
-Clay's AI agent can't access your LinkedIn connections directly. LinkedIn's API doesn't expose connection data. This tool bridges that gap using LinkedIn's own data export feature — the one thing LinkedIn has to give you under GDPR/CCPA.
+Once connections are in Clay, add these columns:
+
+| Column         | Tool                | Maps on                       |
+| -------------- | ------------------- | ----------------------------- |
+| Email          | Apollo / Hunter     | `linkedin_url`                |
+| Company info   | Clearbit            | `company`                     |
+| Current role   | LinkedIn enrichment | `linkedin_url`                |
+| Outreach draft | AI (Claude/GPT)     | `name`, `position`, `company` |
+
+---
+
+## How it works
+
+LinkedIn has no public connections API. This tool:
+
+1. **macOS**: Uses AppleScript to run JavaScript inside your already-open Chrome tab — reads the connections page DOM directly, no new browser or login needed
+2. **Other platforms**: Playwright opens a browser with a persistent session (you log in once, it saves cookies for all future runs)
+3. Deduplicates by LinkedIn profile slug so only new connections are ever sent
+4. POSTs each connection to your Clay webhook — appears as a new row instantly
 
 ---
 
 ## License
 
-MIT
+MIT — build on it, fork it, use it for anything.
