@@ -149,9 +149,3 @@ Planned improvements around v2:
 - feedback loop (mark matches as good/bad to improve ranking)
 - saved goals/searches and periodic re-surfacing as your network changes
 - richer contact modeling (skills, relationships, and ongoing project context)
-
----
-
-## License
-
-MIT — build on it, fork it, and use it for anything.
