@@ -158,30 +158,11 @@ program
     "Scrape LinkedIn connections directly — uses your existing Chrome on macOS, Playwright elsewhere",
   )
   .option(
-    "-w, --webhook <url>",
-    "Clay webhook URL (or set CLAY_WEBHOOK_URL env var)",
-  )
-  .option(
     "--playwright",
     "Force Playwright browser instead of existing Chrome (non-macOS default)",
   )
-  .option("--dry-run", "Scrape without sending to Clay")
+  .option("--dry-run", "Scrape without saving CSV")
   .action(async (opts) => {
-    const config = loadConfig();
-    const webhookUrl =
-      opts.webhook ?? config.clayWebhookUrl ?? process.env.CLAY_WEBHOOK_URL;
-
-    if (!webhookUrl && !opts.dryRun) {
-      console.error(chalk.red("No Clay webhook URL."));
-      console.error(
-        chalk.dim(
-          "Pass --webhook <url>, set CLAY_WEBHOOK_URL env var, or add it to .env",
-        ),
-      );
-      process.exit(1);
-    }
-
-    const alreadySynced = new Set(config.syncedIds);
     let connections: Awaited<ReturnType<typeof scrapeConnections>>;
 
     const useMac = platform() === "darwin" && !opts.playwright;
@@ -220,53 +201,15 @@ program
     console.log(chalk.green(`\n✓ Scraped ${connections.length} connections`));
 
     if (opts.dryRun) {
-      const newCount = connections.filter(
-        (c) => !alreadySynced.has(c.submissionId),
-      ).length;
-      console.log(
-        chalk.yellow(
-          `Dry run — ${newCount} new connections would be sent to Clay`,
-        ),
-      );
+      console.log(chalk.yellow("Dry run — not saving CSV"));
       return;
     }
 
-    const toSync = connections.filter(
-      (c) => !alreadySynced.has(c.submissionId),
-    );
+    const outputPath = saveScrapedConnectionsCsv(connections);
     console.log(
-      chalk.cyan(`Sending ${toSync.length} new connections to Clay...\n`),
+      chalk.green(`✓ Saved ${connections.length} scraped connections to CSV`),
     );
-
-    let i = 0;
-    const result = await syncToClay(
-      toSync,
-      webhookUrl!,
-      alreadySynced,
-      (name, status) => {
-        i++;
-        const icon = status === "sent" ? chalk.green("✓") : chalk.red("✗");
-        process.stdout.write(
-          `\r${icon} [${i}/${toSync.length}] ${name.padEnd(40)}`,
-        );
-      },
-    );
-
-    process.stdout.write("\n\n");
-    console.log(chalk.green(`✓ Sent: ${result.sent}`));
-    if (result.failed.length > 0)
-      console.log(chalk.red(`✗ Failed: ${result.failed.length}`));
-
-    config.syncedIds = [...alreadySynced];
-    config.lastSyncedAt = new Date().toISOString();
-    if (webhookUrl) config.clayWebhookUrl = webhookUrl;
-    saveConfig(config);
-
-    console.log(
-      chalk.dim(
-        `\nState saved — ${toSync.length - result.failed.length} new connections in Clay`,
-      ),
-    );
+    console.log(chalk.dim(`  File: ${outputPath}`));
   });
 
 // ── dedup command ──────────────────────────────────────────────────────────────
@@ -401,7 +344,7 @@ try {
 " 2>/dev/null)
 
 if [ -z "\\$WEBHOOK" ]; then
-  WEBHOOK="\\${CLAY_WEBHOOK_URL:-}"
+  WEBHOOK="\${CLAY_WEBHOOK_URL:-}"
 fi
 
 if [ -z "\\$WEBHOOK" ]; then
@@ -481,6 +424,28 @@ function findLatestLinkedInCsv(): string {
 
   walk(downloads);
   return best.path || join(downloads, "Connections.csv");
+}
+
+function saveScrapedConnectionsCsv(
+  connections: Array<{
+    firstName: string;
+    lastName: string;
+    linkedinUrl: string;
+    connectedOn: string;
+  }>,
+): string {
+  const outPath = join(
+    process.cwd(),
+    `linkedin-connections-${new Date().toISOString().slice(0, 10)}.csv`,
+  );
+  const escape = (v: string) => `"${(v ?? "").replaceAll('"', '""')}"`;
+  const header = ["First Name", "Last Name", "URL", "Connected On"];
+  const rows = connections.map((c) =>
+    [c.firstName, c.lastName, c.linkedinUrl, c.connectedOn].map(escape).join(","),
+  );
+  const csv = [header.map(escape).join(","), ...rows].join("\n");
+  writeFileSync(outPath, csv, "utf-8");
+  return outPath;
 }
 
 program.parse();

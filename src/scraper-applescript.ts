@@ -31,6 +31,7 @@ function makeId(url: string, name: string): string {
 }
 
 function runAppleScript(script: string): string {
+  console.log("[debug] runAppleScript: executing inline AppleScript");
   return execSync(`osascript -e '${script.replace(/'/g, "'\\''")}'`, {
     encoding: "utf-8",
     maxBuffer: 50 * 1024 * 1024, // 50MB for large pages
@@ -39,13 +40,18 @@ function runAppleScript(script: string): string {
 
 function runAppleScriptFile(script: string): string {
   const tmp = join(tmpdir(), `linkedin-clay-${Date.now()}.scpt`);
+  console.log(`[debug] runAppleScriptFile: writing temp script ${tmp}`);
   writeFileSync(tmp, script);
   try {
-    return execSync(`osascript ${tmp}`, {
+    console.log("[debug] runAppleScriptFile: executing temp script");
+    const output = execSync(`osascript ${tmp}`, {
       encoding: "utf-8",
       maxBuffer: 50 * 1024 * 1024,
     }).trim();
+    console.log("[debug] runAppleScriptFile: script execution complete");
+    return output;
   } finally {
+    console.log("[debug] runAppleScriptFile: deleting temp script");
     unlinkSync(tmp);
   }
 }
@@ -53,6 +59,7 @@ function runAppleScriptFile(script: string): string {
 /** Find the Chrome tab that has LinkedIn connections open */
 function findLinkedInTab(): { windowIndex: number; tabIndex: number } | null {
   // First try: check if the active tab of the front window is the connections page
+  console.log("[debug] findLinkedInTab: checking active tab in front window");
   try {
     const activeUrl = execSync(
       `osascript -e 'tell application "Google Chrome" to get URL of active tab of front window'`,
@@ -67,17 +74,22 @@ function findLinkedInTab(): { windowIndex: number; tabIndex: number } | null {
           { encoding: "utf-8", stdio: ["pipe", "pipe", "ignore"] }
         ).trim()
       );
+      console.log(`[debug] findLinkedInTab: found in front window tab ${isNaN(tabIdx) ? 1 : tabIdx}`);
       return { windowIndex: 1, tabIndex: isNaN(tabIdx) ? 1 : tabIdx };
     }
-  } catch {}
+  } catch {
+    console.log("[debug] findLinkedInTab: active-tab check failed, falling back to window/tab scan");
+  }
 
   // Second try: scan all windows/tabs
+  console.log("[debug] findLinkedInTab: scanning all Chrome windows/tabs");
   try {
     const winCount = parseInt(
       execSync(`osascript -e 'tell application "Google Chrome" to count windows'`, {
         encoding: "utf-8", stdio: ["pipe", "pipe", "ignore"],
       }).trim()
     );
+    console.log(`[debug] findLinkedInTab: Chrome window count = ${winCount || 0}`);
 
     for (let w = 1; w <= winCount; w++) {
       const tabCount = parseInt(
@@ -86,23 +98,29 @@ function findLinkedInTab(): { windowIndex: number; tabIndex: number } | null {
           { encoding: "utf-8", stdio: ["pipe", "pipe", "ignore"] }
         ).trim()
       );
+      console.log(`[debug] findLinkedInTab: window ${w} tab count = ${tabCount || 0}`);
       for (let t = 1; t <= tabCount; t++) {
         const url = execSync(
           `osascript -e 'tell application "Google Chrome" to get URL of tab ${t} of window ${w}'`,
           { encoding: "utf-8", stdio: ["pipe", "pipe", "ignore"] }
         ).trim();
         if (url.includes("linkedin.com/mynetwork/invite-connect/connections")) {
+          console.log(`[debug] findLinkedInTab: found target tab at window ${w}, tab ${t}`);
           return { windowIndex: w, tabIndex: t };
         }
       }
     }
-  } catch {}
+  } catch {
+    console.log("[debug] findLinkedInTab: full window/tab scan failed");
+  }
 
+  console.log("[debug] findLinkedInTab: no matching LinkedIn tab found");
   return null;
 }
 
 /** Execute JS in a specific Chrome tab via AppleScript */
 function executeJS(windowIndex: number, tabIndex: number, js: string): string {
+  console.log(`[debug] executeJS: window=${windowIndex}, tab=${tabIndex}, jsLength=${js.length}`);
   const escaped = js.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, " ");
   const script = `
 tell application "Google Chrome"
@@ -119,10 +137,14 @@ async function scrollToLoadAll(
   tabIndex: number,
   onProgress: (count: number) => void
 ): Promise<void> {
+  console.log("[debug] scrollToLoadAll: start");
   let lastCount = 0;
   let noNewRounds = 0;
+  let round = 0;
 
   while (noNewRounds < 4) {
+    round++;
+    console.log(`[debug] scrollToLoadAll: round ${round}, lastCount=${lastCount}, noNewRounds=${noNewRounds}`);
     // Count unique /in/ profile links as a proxy for loaded connections
     const countStr = executeJS(
       windowIndex,
@@ -130,6 +152,7 @@ async function scrollToLoadAll(
       `(function(){ var s={}; document.querySelectorAll("a[href*='/in/']").forEach(function(a){if(a.href)s[a.href.split('?')[0]]=1;}); return Object.keys(s).length; })()`
     );
     const count = parseInt(countStr) || 0;
+    console.log(`[debug] scrollToLoadAll: countStr="${countStr}", parsed=${count}`);
     onProgress(count);
 
     if (count === lastCount) {
@@ -140,9 +163,11 @@ async function scrollToLoadAll(
     }
 
     // Scroll to bottom to trigger infinite scroll
+    console.log("[debug] scrollToLoadAll: scrolling to bottom");
     executeJS(windowIndex, tabIndex, "window.scrollTo(0, document.body.scrollHeight)");
 
     // Click "Show more" if present
+    console.log("[debug] scrollToLoadAll: attempting show-more click");
     executeJS(
       windowIndex,
       tabIndex,
@@ -152,12 +177,15 @@ async function scrollToLoadAll(
       })()`
     );
 
+    console.log("[debug] scrollToLoadAll: waiting 1500ms");
     await new Promise((r) => setTimeout(r, 1500));
   }
+  console.log("[debug] scrollToLoadAll: done (noNewRounds reached 4)");
 }
 
 /** Extract all connection data via localStorage (bypasses CSP) */
 async function extractConnections(windowIndex: number, tabIndex: number): Promise<ScrapedConnection[]> {
+  console.log("[debug] extractConnections: start");
   // Step 1: run extraction JS in Chrome, store result in localStorage
   const extractJs = `
 (function() {
@@ -187,33 +215,41 @@ async function extractConnections(windowIndex: number, tabIndex: number): Promis
   return results.length;
 })()`;
 
+  console.log("[debug] extractConnections: executing extraction JS");
   const countStr = executeJS(windowIndex, tabIndex, extractJs);
   console.log(`  Stored ${countStr} connections in localStorage...`);
 
   // Step 2: read it back in chunks (localStorage values can be large but AppleScript has limits)
   // Split by reading total length first, then chunking
+  console.log("[debug] extractConnections: reading stored JSON length");
   const totalStr = executeJS(
     windowIndex, tabIndex,
     `localStorage.getItem("__lcs_connections__") ? localStorage.getItem("__lcs_connections__").length : 0`
   );
   const total = parseInt(totalStr) || 0;
+  console.log(`[debug] extractConnections: total JSON length=${total}`);
 
   const CHUNK = 200_000; // 200KB per read
   let json = "";
   for (let offset = 0; offset < total; offset += CHUNK) {
+    console.log(`[debug] extractConnections: reading chunk at offset ${offset}`);
     const chunk = executeJS(
       windowIndex, tabIndex,
       `localStorage.getItem("__lcs_connections__").slice(${offset}, ${offset + CHUNK})`
     );
+    console.log(`[debug] extractConnections: chunk length=${chunk.length}`);
     json += chunk;
   }
 
   // Clean up
+  console.log("[debug] extractConnections: cleaning localStorage key");
   executeJS(windowIndex, tabIndex, `localStorage.removeItem("__lcs_connections__")`);
 
+  console.log(`[debug] extractConnections: parsing JSON (${json.length} chars)`);
   const items = JSON.parse(json) as Array<{
     url: string; name: string; position: string; company: string; connectedOn: string;
   }>;
+  console.log(`[debug] extractConnections: parsed ${items.length} items`);
 
   return items.map((item) => {
     const [firstName = "", ...rest] = item.name.split(" ");
@@ -234,11 +270,13 @@ async function extractConnections(windowIndex: number, tabIndex: number): Promis
 export async function scrapeViaAppleScript(opts: {
   onProgress?: (scraped: number, pushed: number, name: string) => void;
 }): Promise<ScrapedConnection[]> {
+  console.log("[debug] scrapeViaAppleScript: start");
   if (platform() !== "darwin") {
     throw new Error("AppleScript mode only works on macOS. Use --playwright mode on other platforms.");
   }
 
   // Find the LinkedIn connections tab
+  console.log("[debug] scrapeViaAppleScript: locating LinkedIn tab");
   const tab = findLinkedInTab();
   if (!tab) {
     throw new Error(
@@ -265,6 +303,7 @@ export async function scrapeViaAppleScript(opts: {
 
   const connections = await extractConnections(tab.windowIndex, tab.tabIndex);
   console.log(`✓ Extracted ${connections.length} connections\n`);
+  console.log("[debug] scrapeViaAppleScript: complete");
 
   return connections;
 }
